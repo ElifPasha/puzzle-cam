@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+<meta
+ name="description"
+ content="PuzzleCam ile el hareketlerini kullanarak fotoğraf çek, yapbozunu tamamla ve anılarını biriktir."
+/>
+
+  <meta name="theme-color" content="#0b0b12" />
+
+  <title>PuzzleCam | Hareketle Yakala</title>
+
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+
+<body>
+  <div id="app">
+
+<main id="stage" aria-label="Kamera ve yapboz alanı">
+  <video
+    id="webcam"
+    playsinline
+    autoplay
+    muted
+    aria-label="Canlı kamera görüntüsü"
+  ></video>
+
+  <canvas
+    id="sceneCanvas"
+    aria-label="El hareketleriyle kontrol edilen yapboz"
+  ></canvas>
+
+  <header class="hud-top">
+    <div class="brand">
+      PUZZLE<span>·</span>CAM
+    </div>
+
+    <div class="status-pill" role="status" aria-live="polite">
+      <span id="statusDot" class="status-dot"></span>
+      <span id="statusText">Kamera başlatılıyor...</span>
+    </div>
+  </header>
+
+  <div id="progressBadge" class="progress-badge">
+    <span id="progressText">0 / 9 parça yerleştirildi</span>
+  </div>
+
+  <div id="loadingOverlay">
+    <div class="loader-text" id="loaderText">Yükleniyor...</div>
+
+    <div class="loader-bar"></div>
+
+    <button
+      type="button"
+      id="loaderRetry"
+      class="loader-retry hidden"
+    >
+      Tekrar dene
+    </button>
+  </div>
+  <footer class="hud-bottom">
+  <div class="gesture-key" aria-label="El hareketleri rehberi">
+    <span class="item">
+      <span class="swatch"></span>
+      Parmaklarınla çerçeve yap
+    </span>
+    <span class="item">
+      <span class="swatch pinch"></span>
+      Parmak uçlarını birleştir
+    </span>
+    <span class="item">
+      <span class="swatch fist"></span>
+      Yumruk: kaydet
+    </span>
+  </div>
+</footer>
+  <div id="errorBanner" role="alert"></div>
+</main>
+
+<aside id="gallery" aria-label="Tamamlanan yapbozlar">
+
+  <div class="gallery-head">
+    <div class="gallery-title">Anı Galerisi</div>
+
+    <span class="gallery-count" id="galleryCount">
+      0 / 3
+    </span>
+  </div>
+
+  <p class="gallery-description">
+    Yapbozlarını tamamla, anılarını biriktir.
+  </p>
+
+  <div class="strip-complete-msg" id="stripCompleteMsg">
+    Galerin hazır! Fotoğraf şeridini indirebilir veya yeni bir oyun başlatabilirsin.
+  </div>
+
+  <div id="galleryStrip" class="gallery-strip">
+    <div class="gallery-empty" id="galleryEmpty">
+      <span class="gallery-empty-icon" aria-hidden="true">📸</span>
+      <strong>Henüz anı yok</strong>
+      <span>Tamamladığın yapbozlar burada görünecek.</span>
+    </div>
+  </div>
+
+  <div class="gallery-actions">
+    <button
+      type="button"
+      id="downloadStripBtn"
+      class="gallery-action-btn"
+      disabled
+    >
+      Fotoğraf şeridini indir
+    </button>
+
+    <button
+      type="button"
+      id="resetAllBtn"
+      class="gallery-action-btn gallery-action-btn--danger"
+    >
+      Baştan başla
+    </button>
+  </div>
+
+</aside>
+
+  </div>
+
+  <script type="module" src="./app.js"></script>
+
+</body>
+</html>
