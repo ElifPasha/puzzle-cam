@@ -16,12 +16,17 @@ const LM = {
   PINKY_MCP: 17,
 };
 
-const PINCH_RATIO = 0.3; // pinch eşiği: el boyutunun oranı
-const SMOOTH_ALPHA = 0.6; // 1 = yumuşatma yok, düşük değer = daha yumuşak
+const PINCH_ON_RATIO = 0.3;   // pinch başlatma eşiği (el boyutunun oranı)
+const PINCH_OFF_RATIO = 0.45; // pinch bırakma eşiği (histerezis, titremeyi önler)
+const SMOOTH_MIN = 0.5;      // yavaş harekette güçlü yumuşatma
+const SMOOTH_MAX = 0.95;      // hızlı harekette neredeyse gecikmesiz
+const SMOOTH_SPEED_REF = 0.04;
+const DROP_GRACE_FRAMES = 4;  // el 1-2 kare kaybolursa parçayı bırakma
+
 const FRAME_PADDING = 28;
-const FREEZE_HOLD_MS = 250;
+const FREEZE_HOLD_MS = 150;
 const COUNTDOWN_SECONDS = 3;
-const FIST_HOLD_FRAMES = 12;
+const FIST_HOLD_FRAMES = 8;
 const SNAP_DISTANCE_RATIO = 0.45;
 const GRID = 3;
 const LOAD_TIMEOUT_MS = 20000;
@@ -41,7 +46,10 @@ const HAND_CONNECTIONS = [
 
 const videoEl = document.getElementById("webcam");
 const canvas = document.getElementById("sceneCanvas");
-const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+// Tarayıcı ctx.filter destekliyorsa canlı efekt GPU'da çalışır, canvas yazılım moduna alınmaz.
+const SUPPORTS_CTX_FILTER = "filter" in CanvasRenderingContext2D.prototype;
+const ctx = canvas.getContext("2d", { willReadFrequently: !SUPPORTS_CTX_FILTER });
 
 const statusDot = document.getElementById("statusDot");
 const statusText = document.getElementById("statusText");
@@ -68,6 +76,7 @@ const puzzle = {
   tileW: 0,
   tileH: 0,
   moves: 0,
+  fullPhotoboothCanvas: null,
 };
 
 const SHATTER_COLS = 6;
@@ -76,6 +85,7 @@ const SHATTER_DURATION_MS = 850;
 const shatter = {
   active: false,
   startedAt: 0,
+  lastAt: 0,
   fragments: [],
   pendingCanvas: null,
 };
@@ -91,8 +101,8 @@ function addToGallery(snapshotCanvas) {
   galleryCount.textContent = `${galleryEntries.length} / ${STRIP_MAX_PHOTOS}`;
   if (galleryEmpty) galleryEmpty.style.display = "none";
 
-  //Galeride 1 fotoğraf bile olsa indir butonunu aktif
-  updateStripDownloadAvailability(); 
+  // Galeride 1 fotoğraf bile olsa indir butonunu aktif et
+  updateStripDownloadAvailability();
 
   if (galleryEntries.length >= STRIP_MAX_PHOTOS) {
     showStripComplete();
@@ -212,6 +222,10 @@ function resetPuzzleOnly() {
   shatter.fragments = [];
   shatter.pendingCanvas = null;
   fistHoldCounter = 0;
+  lostDragFrames = 0;
+  pinchState.Left = false;
+  pinchState.Right = false;
+  freezeGate.holding = false;
   lastSeenFrame.box = null;
   lastSeenFrame.at = 0;
   updateProgressBadge();
@@ -244,7 +258,12 @@ async function initWebcam() {
     throw new Error("Bu tarayıcı kamera erişimini (getUserMedia) desteklemiyor.");
   }
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+    video: {
+      width: { ideal: 960 },
+      height: { ideal: 540 },
+      frameRate: { ideal: 60 },
+      facingMode: "user",
+    },
     audio: false,
   });
   videoEl.srcObject = stream;
@@ -278,9 +297,9 @@ function createLandmarker(vision, delegate, timeoutMessage) {
       baseOptions: { modelAssetPath: HAND_MODEL_URL, delegate },
       runningMode: "video",
       numHands: 2,
-      minHandDetectionConfidence: 0.6,
-      minHandPresenceConfidence: 0.6,
-      minTrackingConfidence: 0.6,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
     }),
     LOAD_TIMEOUT_MS,
     timeoutMessage
@@ -319,10 +338,19 @@ function dist2D(a, b) {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
-//Elin boyuna (bilek -> orta parmak kökü) göre hesaplanır.
-function isPinching(landmarks) {
+// Elin boyuna (bilek -> orta parmak kökü) göre hesaplanır.
+// Histerezis: pinch başladıktan sonra daha geniş eşikle bırakılır, böylece titreme parçayı düşürmez.
+const pinchState = { Left: false, Right: false };
+
+function isPinching(landmarks, wasPinching = false) {
   const handSize = dist2D(landmarks[LM.WRIST], landmarks[LM.MIDDLE_MCP]);
-  return dist2D(landmarks[LM.THUMB_TIP], landmarks[LM.INDEX_TIP]) < handSize * PINCH_RATIO;
+  const ratio = wasPinching ? PINCH_OFF_RATIO : PINCH_ON_RATIO;
+  return dist2D(landmarks[LM.THUMB_TIP], landmarks[LM.INDEX_TIP]) < handSize * ratio;
+}
+
+function updatePinch(label, lm) {
+  pinchState[label] = isPinching(lm, pinchState[label]);
+  return pinchState[label];
 }
 
 function isFist(landmarks) {
@@ -346,6 +374,16 @@ function toPixel(landmarkNorm) {
 
 function mirrorLandmarkX(landmark) {
   return { x: 1 - landmark.x, y: landmark.y };
+}
+
+// Parçayı işaret ucu yerine baş-işaret parmağı ortasından tut (daha doğal)
+function pinchPoint(lm) {
+  return toPixel(
+    mirrorLandmarkX({
+      x: (lm[LM.THUMB_TIP].x + lm[LM.INDEX_TIP].x) / 2,
+      y: (lm[LM.THUMB_TIP].y + lm[LM.INDEX_TIP].y) / 2,
+    })
+  );
 }
 
 function computeHandFrame(indexTipA, indexTipB) {
@@ -425,6 +463,7 @@ function gaussianNoise(std) {
 // Her karede piksel başına log/cos hesaplamamak için hazır gürültü tablosu
 const NOISE_TABLE = Float32Array.from({ length: 65536 }, () => gaussianNoise(PHOTOBOOTH_NOISE_STD));
 
+// Tam piksel hesaplı efekt: yalnızca çekilen son fotoğraf için kullanılır
 function applyPhotoboothEffect(imageData) {
   const noiseOffset = (Math.random() * 65536) | 0;
   const d = imageData.data;
@@ -436,6 +475,64 @@ function applyPhotoboothEffect(imageData) {
     d[i] = d[i + 1] = d[i + 2] = v;
   }
   return imageData;
+}
+
+// Canlı önizleme için hazır gürültü dokusu (GPU üzerinde bindirilir)
+const noiseCanvas = (() => {
+  const c = document.createElement("canvas");
+  c.width = c.height = 256;
+  const nctx = c.getContext("2d");
+  const img = nctx.createImageData(256, 256);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = Math.max(0, Math.min(255, 128 + NOISE_TABLE[(i >> 2) & 65535] * 3));
+    img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+    img.data[i + 3] = 255;
+  }
+  nctx.putImageData(img, 0, 0);
+  return c;
+})();
+const noisePattern = ctx.createPattern(noiseCanvas, "repeat");
+
+function applyBWInsideBoxSlow(x, y, w, h) {
+  const region = ctx.getImageData(x, y, w, h);
+  applyPhotoboothEffect(region);
+  ctx.putImageData(region, x, y);
+}
+
+function applyBWInsideBox(box) {
+  const x = Math.max(0, Math.round(box.x));
+  const y = Math.max(0, Math.round(box.y));
+  const w = Math.min(canvas.width - x, Math.round(box.width));
+  const h = Math.min(canvas.height - y, Math.round(box.height));
+  if (w <= 0 || h <= 0) return;
+
+  if (!SUPPORTS_CTX_FILTER) {
+    applyBWInsideBoxSlow(x, y, w, h);
+    return;
+  }
+
+  // GPU filtresi: piksel döngüsü yok
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.filter = `grayscale(1) contrast(${PHOTOBOOTH_CONTRAST_ALPHA}) brightness(1.10)`;
+  ctx.translate(canvas.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+
+  // Hazır gürültü dokusu (her karede rastgele kaydırılır)
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.globalCompositeOperation = "overlay";
+  ctx.globalAlpha = 0.35;
+  ctx.fillStyle = noisePattern;
+  ctx.translate((Math.random() * 256) | 0, (Math.random() * 256) | 0);
+  ctx.fillRect(x - 256, y - 256, w + 512, h + 512);
+  ctx.restore();
 }
 
 function shuffle(arr) {
@@ -761,18 +858,6 @@ function drawVideoFrame() {
   ctx.restore();
 }
 
-function applyBWInsideBox(box) {
-  const x = Math.max(0, Math.round(box.x));
-  const y = Math.max(0, Math.round(box.y));
-  const w = Math.min(canvas.width - x, Math.round(box.width));
-  const h = Math.min(canvas.height - y, Math.round(box.height));
-  if (w <= 0 || h <= 0) return;
-
-  const region = ctx.getImageData(x, y, w, h);
-  applyPhotoboothEffect(region);
-  ctx.putImageData(region, x, y);
-}
-
 function drawLiveFrameOverlay(box) {
   ctx.save();
   ctx.strokeStyle = "#b69cff";
@@ -897,19 +982,23 @@ function startShatter(sourceCanvas, box) {
   shatter.fragments = fragments;
   shatter.active = true;
   shatter.startedAt = performance.now();
+  shatter.lastAt = shatter.startedAt;
   appState = "shattering";
 }
 
 function updateAndDrawShatter() {
-  const elapsedMs = performance.now() - shatter.startedAt;
+  const now = performance.now();
+  const elapsedMs = now - shatter.startedAt;
   const t = Math.min(1, elapsedMs / SHATTER_DURATION_MS);
+  // Gerçek geçen süre: düşük fps'te animasyon yavaşlamaz
+  const dt = Math.min(0.05, (now - (shatter.lastAt || now)) / 1000);
+  shatter.lastAt = now;
 
   if (t >= 1) {
     finishShatter();
     return;
   }
 
-  const dt = 1 / 60;
   const fadeStart = 0.45;
 
   ctx.save();
@@ -965,9 +1054,11 @@ function handleFistReset() {
 
 let handLandmarker = null;
 let fistHoldCounter = 0;
+let lostDragFrames = 0;
 
 // El noktalarını yumuşatır (titremeyi azaltır) ve ellere sol/sağ etiketi verir.
 // Etiket sırası kareden kareye değişse bile sürükleme doğru ele bağlı kalır.
+// Yumuşatma hıza duyarlıdır: yavaşken güçlü, hızlıyken neredeyse gecikmesiz.
 const smoothState = {};
 
 function smoothHands(result) {
@@ -982,22 +1073,31 @@ function smoothHands(result) {
     used.add(label);
 
     const prev = smoothState[label];
-    const smoothed = lm.map((p, j) =>
-      prev
-        ? {
-            x: prev[j].x + (p.x - prev[j].x) * SMOOTH_ALPHA,
-            y: prev[j].y + (p.y - prev[j].y) * SMOOTH_ALPHA,
-            z: p.z,
-          }
-        : { x: p.x, y: p.y, z: p.z }
-    );
+    let smoothed;
+    if (!prev) {
+      smoothed = lm.map((p) => ({ x: p.x, y: p.y, z: p.z }));
+    } else {
+      const tip = lm[LM.INDEX_TIP];
+      const ptip = prev[LM.INDEX_TIP];
+      const speed = Math.hypot(tip.x - ptip.x, tip.y - ptip.y);
+      const t = Math.min(1, speed / SMOOTH_SPEED_REF);
+      const alpha = SMOOTH_MIN + (SMOOTH_MAX - SMOOTH_MIN) * t;
+      smoothed = lm.map((p, j) => ({
+        x: prev[j].x + (p.x - prev[j].x) * alpha,
+        y: prev[j].y + (p.y - prev[j].y) * alpha,
+        z: p.z,
+      }));
+    }
     smoothState[label] = smoothed;
     hands.push(smoothed);
     labels.push(label);
   });
 
   for (const key of Object.keys(smoothState)) {
-    if (!used.has(key)) delete smoothState[key];
+    if (!used.has(key)) {
+      delete smoothState[key];
+      pinchState[key] = false;
+    }
   }
   return { hands, labels };
 }
@@ -1017,8 +1117,14 @@ function processResults(result) {
     fistHoldCounter = 0;
     freezeGate.holding = false;
 
+    // El 1-2 kare kaybolursa parçayı hemen bırakma
     if (drag.activeHand && drag.piece) {
-      handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+      if (++lostDragFrames >= DROP_GRACE_FRAMES) {
+        handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+        lostDragFrames = 0;
+      }
+    } else {
+      lostDragFrames = 0;
     }
 
     if (appState === "tracking") {
@@ -1084,7 +1190,9 @@ function processResults(result) {
         lastSeenFrame.at = performance.now();
       }
 
-      const bothPinching = isPinching(handA) && isPinching(handB);
+      const pA = updatePinch(handLabels[0], handA);
+      const pB = updatePinch(handLabels[1], handB);
+      const bothPinching = pA && pB;
       if (bothPinching && frameBox.width > 40 && frameBox.height > 40) {
         if (!freezeGate.holding) {
           freezeGate.holding = true;
@@ -1123,13 +1231,18 @@ function processResults(result) {
     handsLandmarks.forEach((lm, i) => {
       const label = handLabels[i];
       labelsPresent.add(label);
-      const pinching = isPinching(lm);
-      const indexPx = toPixel(mirrorLandmarkX(lm[LM.INDEX_TIP]));
+      const pinching = updatePinch(label, lm);
+      const indexPx = pinchPoint(lm);
       handleDragForHand(label, pinching, indexPx);
     });
 
     if (drag.activeHand && !labelsPresent.has(drag.activeHand) && drag.piece) {
-      handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+      if (++lostDragFrames >= DROP_GRACE_FRAMES) {
+        handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+        lostDragFrames = 0;
+      }
+    } else {
+      lostDragFrames = 0;
     }
 
     if (!drag.piece) {
@@ -1148,14 +1261,28 @@ function processResults(result) {
   }
 }
 
+const EMPTY_RESULT = { landmarks: [], handedness: [] };
+let lastVideoTime = -1;
+
 function renderLoop() {
-  if (videoEl.readyState >= 2 && handLandmarker) {
-    drawVideoFrame();
-    const nowMs = performance.now();
-    const result = handLandmarker.detectForVideo(videoEl, nowMs);
-    processResults(result);
-  }
   requestAnimationFrame(renderLoop);
+  if (!handLandmarker || videoEl.readyState < 2) return;
+
+  const shattering = appState === "shattering";
+  const isNewFrame = videoEl.currentTime !== lastVideoTime;
+  if (!isNewFrame && !shattering) return; // aynı kare için tekrar tespit yapma
+  lastVideoTime = videoEl.currentTime;
+
+  drawVideoFrame();
+
+  let result = EMPTY_RESULT;
+  if (appState === "countdown" || shattering) {
+    // Bu aşamalarda el tespiti gerekmez, işlemciyi rahatlat
+    for (const k of Object.keys(smoothState)) delete smoothState[k];
+  } else {
+    result = handLandmarker.detectForVideo(videoEl, performance.now());
+  }
+  processResults(result);
 }
 
 function showError(message) {
@@ -1176,6 +1303,8 @@ function resetLoaderUI() {
   loaderRetry.classList.add("hidden");
   errorBanner.style.display = "none";
 }
+
+let loopStarted = false;
 
 async function boot() {
   resetLoaderUI();
@@ -1199,7 +1328,10 @@ async function boot() {
     clearTimeout(watchdog);
     loadingOverlay.classList.add("hidden");
     statusText.textContent = "hazır";
-    requestAnimationFrame(renderLoop);
+    if (!loopStarted) {
+      loopStarted = true;
+      requestAnimationFrame(renderLoop);
+    }
   } catch (err) {
     settled = true;
     clearTimeout(watchdog);
